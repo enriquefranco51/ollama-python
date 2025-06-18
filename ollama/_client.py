@@ -25,6 +25,7 @@ from typing import (
 import anyio
 from pydantic.json_schema import JsonSchemaValue
 
+from ollama._auth import OllamaAuth
 from ollama._utils import convert_function_to_tool
 
 if sys.version_info < (3, 9):
@@ -80,6 +81,7 @@ class BaseClient:
     follow_redirects: bool = True,
     timeout: Any = None,
     headers: Optional[Mapping[str, str]] = None,
+    auth_key_path: Optional[str] = None,
     **kwargs,
   ) -> None:
     """
@@ -87,9 +89,10 @@ class BaseClient:
     except for the following:
     - `follow_redirects`: True
     - `timeout`: None
+    - `auth_key_path`: Optional path to the Ed25519 private key for authentication
     `kwargs` are passed to the httpx client.
     """
-
+    self._auth = OllamaAuth(auth_key_path) if auth_key_path else None
     self._client = client(
       base_url=_parse_host(host or os.getenv('OLLAMA_HOST')),
       follow_redirects=follow_redirects,
@@ -106,6 +109,32 @@ class BaseClient:
       },
       **kwargs,
     )
+
+  def _prepare_request(self, method: str, path: str, **kwargs) -> Dict[str, Any]:
+    """Prepare request parameters with authentication if enabled."""
+    if self._auth:
+      # Get the full path including query parameters from the URL
+      url = str(self._client.build_request(method, path).url)
+      parsed = urllib.parse.urlparse(url)
+      full_path = parsed.path
+      if parsed.query:
+        full_path = f"{full_path}?{parsed.query}"
+      
+      # Sign the request
+      auth_token, timestamp = self._auth.sign_request(method, full_path)
+      
+      # Add auth header
+      if 'headers' not in kwargs:
+        kwargs['headers'] = {}
+      kwargs['headers']['Authorization'] = auth_token
+      
+      # Add timestamp to URL
+      if '?' in path:
+        path = f"{path}&ts={timestamp}"
+      else:
+        path = f"{path}?ts={timestamp}"
+        
+    return {'method': method, 'url': path, **kwargs}
 
 
 CONNECTION_ERROR_MESSAGE = 'Failed to connect to Ollama. Please check that Ollama is downloaded, running and accessible. https://ollama.com/download'
@@ -155,29 +184,33 @@ class Client(BaseClient):
   def _request(
     self,
     cls: Type[T],
-    *args,
+    method: str,
+    path: str,
+    *,
     stream: bool = False,
     **kwargs,
   ) -> Union[T, Iterator[T]]:
+    """Make a request with optional authentication."""
+    request_params = self._prepare_request(method, path, **kwargs)
+    
     if stream:
+        def inner():
+            with self._client.stream(**request_params) as r:
+                try:
+                    r.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    e.response.read()
+                    raise ResponseError(e.response.text, e.response.status_code) from None
 
-      def inner():
-        with self._client.stream(*args, **kwargs) as r:
-          try:
-            r.raise_for_status()
-          except httpx.HTTPStatusError as e:
-            e.response.read()
-            raise ResponseError(e.response.text, e.response.status_code) from None
+                for line in r.iter_lines():
+                    part = json.loads(line)
+                    if err := part.get('error'):
+                        raise ResponseError(err)
+                    yield cls(**part)
 
-          for line in r.iter_lines():
-            part = json.loads(line)
-            if err := part.get('error'):
-              raise ResponseError(err)
-            yield cls(**part)
+        return inner()
 
-      return inner()
-
-    return cls(**self._request_raw(*args, **kwargs).json())
+    return cls(**self._request_raw(**request_params).json())
 
   @overload
   def generate(
@@ -667,29 +700,33 @@ class AsyncClient(BaseClient):
   async def _request(
     self,
     cls: Type[T],
-    *args,
+    method: str,
+    path: str,
+    *,
     stream: bool = False,
     **kwargs,
   ) -> Union[T, AsyncIterator[T]]:
+    """Make a request with optional authentication."""
+    request_params = self._prepare_request(method, path, **kwargs)
+    
     if stream:
+        async def inner():
+            async with self._client.stream(**request_params) as r:
+                try:
+                    r.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    await e.response.aread()
+                    raise ResponseError(e.response.text, e.response.status_code) from None
 
-      async def inner():
-        async with self._client.stream(*args, **kwargs) as r:
-          try:
-            r.raise_for_status()
-          except httpx.HTTPStatusError as e:
-            await e.response.aread()
-            raise ResponseError(e.response.text, e.response.status_code) from None
+                async for line in r.aiter_lines():
+                    part = json.loads(line)
+                    if err := part.get('error'):
+                        raise ResponseError(err)
+                    yield cls(**part)
 
-          async for line in r.aiter_lines():
-            part = json.loads(line)
-            if err := part.get('error'):
-              raise ResponseError(err)
-            yield cls(**part)
+        return inner()
 
-      return inner()
-
-    return cls(**(await self._request_raw(*args, **kwargs)).json())
+    return cls(**(await self._request_raw(**request_params)).json())
 
   @overload
   async def generate(
